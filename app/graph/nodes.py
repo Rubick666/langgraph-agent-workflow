@@ -1,10 +1,13 @@
+from langgraph.types import interrupt
+
 from app.core.llm import llm
-from app.graph.state import TicketState
 from app.graph.policies import get_policy
+from app.graph.state import TicketState
 
 ALLOWED_CATEGORIES = {"billing", "technical", "shipping", "account", "other"}
 
 
+# ---------------------------------------------------------------- classify
 async def classify_node(state: TicketState) -> dict:
     ticket = state["ticket_text"]
 
@@ -38,25 +41,53 @@ async def classify_node(state: TicketState) -> dict:
         ],
     }
 
-async def retrieve_policy_node(state: TicketState) -> dict:
-    """Look up the policy text for the classified category."""
-    category = state.get("category", "other")
-    policy = get_policy(category)
+
+# --------------------------------------------------- review_classification
+async def review_classification_node(state: TicketState) -> dict:
+    """Pause the graph and ask a human to confirm or override the category."""
+    payload = {
+        "reason": "low_classification_confidence",
+        "ticket_text": state.get("ticket_text"),
+        "suggested_category": state.get("category", "other"),
+        "allowed_categories": sorted(ALLOWED_CATEGORIES),
+        "instructions": (
+            "Reply with {'action': 'confirm'} to keep the suggested category, "
+            "or {'action': 'override', 'category': '<one of allowed_categories>'}."
+        ),
+    }
+
+    # -------- the graph pauses here --------
+    human = interrupt(payload)
+    # -------- on resume, `human` is what the client sent --------
+
+    if human.get("action") == "override" and human.get("category") in ALLOWED_CATEGORIES:
+        category = human["category"]
+    else:
+        category = state.get("category", "other")
 
     return {
-        "policy_reference": policy,
+        "category": category,
+        "is_confident": True,           # human-confirmed
+        "human_action": human.get("action"),
+        "human_note": human.get("note"),
         "trace": state.get("trace", []) + [
-            {"node": "retrieve_policy", "category": category}
+            {"node": "review_classification", "final_category": category, "human": human}
         ],
     }
 
 
-async def decide_node(state: TicketState) -> dict:
-    """Decide whether to respond directly or escalate to a human.
+# ------------------------------------------------------- retrieve_policy
+async def retrieve_policy_node(state: TicketState) -> dict:
+    category = state.get("category", "other")
+    policy = get_policy(category)
+    return {
+        "policy_reference": policy,
+        "trace": state.get("trace", []) + [{"node": "retrieve_policy", "category": category}],
+    }
 
-    Rule of thumb: escalate ONLY when the policy does not cover the case,
-    or the customer is explicitly demanding a human.
-    """
+
+# ---------------------------------------------------------------- decide
+async def decide_node(state: TicketState) -> dict:
     ticket = state["ticket_text"]
     policy = state.get("policy_reference", "")
     category = state.get("category", "other")
@@ -84,7 +115,7 @@ async def decide_node(state: TicketState) -> dict:
     raw = (response.content or "").strip().lower()
     decision = raw.split()[0].strip(".,!?:;\"'") if raw else ""
     if decision not in {"respond", "escalate"}:
-        decision = "respond"   # safer default: policy almost always covers something
+        decision = "respond"
 
     return {
         "decision": decision,
@@ -94,8 +125,38 @@ async def decide_node(state: TicketState) -> dict:
     }
 
 
+# ------------------------------------------------------ review_escalation
+async def review_escalation_node(state: TicketState) -> dict:
+    """Pause the graph and ask a human to approve escalation or force a response."""
+    payload = {
+        "reason": "escalation_requires_approval",
+        "ticket_text": state.get("ticket_text"),
+        "category": state.get("category"),
+        "policy_reference": state.get("policy_reference"),
+        "suggested_decision": state.get("decision"),
+        "instructions": (
+            "Reply with {'action': 'approve'} to escalate to a human agent, "
+            "or {'action': 'respond'} to attempt an automated reply."
+        ),
+    }
+
+    human = interrupt(payload)
+
+    action = human.get("action")
+    new_decision = "escalate" if action == "approve" else "respond"
+
+    return {
+        "decision": new_decision,
+        "human_action": action,
+        "human_note": human.get("note"),
+        "trace": state.get("trace", []) + [
+            {"node": "review_escalation", "final_decision": new_decision, "human": human}
+        ],
+    }
+
+
+# ---------------------------------------------------------------- draft
 async def draft_node(state: TicketState) -> dict:
-    """Draft a short, professional reply to the customer."""
     ticket = state["ticket_text"]
     policy = state.get("policy_reference", "")
     category = state.get("category", "other")
@@ -115,22 +176,5 @@ async def draft_node(state: TicketState) -> dict:
 
     return {
         "draft_response": draft,
-        "trace": state.get("trace", []) + [
-            {"node": "draft", "chars": len(draft)}
-        ],
-    }
-
-
-async def human_review_node(state: TicketState) -> dict:
-    """Terminal node for low-confidence tickets.
-
-    For now this simply marks the run as needing human review.
-    In Step 3 we'll add checkpointing so a run can be paused here and resumed.
-    """
-    return {
-        "decision": "human_review",
-        "draft_response": None,
-        "trace": state.get("trace", []) + [
-            {"node": "human_review", "reason": "low classification confidence"}
-        ],
+        "trace": state.get("trace", []) + [{"node": "draft", "chars": len(draft)}],
     }

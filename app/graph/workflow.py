@@ -1,56 +1,63 @@
-from functools import lru_cache
-
 from langgraph.graph import END, START, StateGraph
 
 from app.graph.nodes import (
     classify_node,
     decide_node,
     draft_node,
-    human_review_node,
     retrieve_policy_node,
+    review_classification_node,
+    review_escalation_node,
 )
 from app.graph.state import TicketState
 
 
-def _route_after_classify(state: TicketState) -> str:
-    """Conditional edge: confident → normal path, otherwise → human review."""
-    return "retrieve_policy" if state.get("is_confident") else "human_review"
+def _after_classify(state: TicketState) -> str:
+    return "retrieve_policy" if state.get("is_confident") else "review_classification"
 
 
-def _build_graph():
+def _after_decide(state: TicketState) -> str:
+    return "review_escalation" if state.get("decision") == "escalate" else "draft"
+
+
+def build_graph():
     g = StateGraph(TicketState)
 
-    # Nodes
     g.add_node("classify", classify_node)
+    g.add_node("review_classification", review_classification_node)
     g.add_node("retrieve_policy", retrieve_policy_node)
     g.add_node("decide", decide_node)
+    g.add_node("review_escalation", review_escalation_node)
     g.add_node("draft", draft_node)
-    g.add_node("human_review", human_review_node)
 
-    # Entry
     g.add_edge(START, "classify")
 
-    # Conditional branch after classification
     g.add_conditional_edges(
         "classify",
-        _route_after_classify,
+        _after_classify,
         {
             "retrieve_policy": "retrieve_policy",
-            "human_review": "human_review",
+            "review_classification": "review_classification",
         },
     )
 
-    # Linear path
+    g.add_edge("review_classification", "retrieve_policy")
     g.add_edge("retrieve_policy", "decide")
-    g.add_edge("decide", "draft")
+
+    g.add_conditional_edges(
+        "decide",
+        _after_decide,
+        {
+            "draft": "draft",
+            "review_escalation": "review_escalation",
+        },
+    )
+
+    g.add_conditional_edges(
+        "review_escalation",
+        lambda s: "draft" if s.get("decision") == "respond" else "end",
+        {"draft": "draft", "end": END},
+    )
+
     g.add_edge("draft", END)
 
-    # Human review terminates the run
-    g.add_edge("human_review", END)
-
-    return g.compile()
-
-
-@lru_cache
-def get_graph():
-    return _build_graph()
+    return g
