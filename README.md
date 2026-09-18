@@ -263,8 +263,3 @@ docker-compose exec api python -m scripts.run_dataset
 * **Policy store from DB** — move the `POLICIES` dict into a table so non-engineers can edit policies.
 * **Structured output** — use a JSON-mode model for classification to remove the string parsing entirely.
 * **Timeout / retry on LLM calls** — currently a slow model blocks the request thread.
-
-```
-
-This is now a single clean README with valid Markdown fencing throughout and no stray `svgsvg`/language-label artifacts.
-```
